@@ -1,0 +1,7 @@
+[[constraint]]
+name = "github.com/buildkite/terminal-to-html"
+version = "3.2.0"
+
+[prune]
+  go-tests = true
+  unused-packages = true
