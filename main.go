@@ -5,6 +5,7 @@ import (
 	"html/template"
 	"io"
 	"net/http"
+	"os"
 	"os/exec"
 	"strings"
 
@@ -12,6 +13,24 @@ import (
 )
 
 func main() {
+	var err error
+	ansi2html := strings.TrimSpace(os.Getenv("ANSI2HTML"))
+	if ansi2html == "" {
+		ansi2html, err = exec.LookPath("ansi2html")
+		if err != nil {
+			ansi2html = ""
+		}
+	}
+	if ansi2html != "" {
+		infos, err := os.Stat(ansi2html)
+		if err != nil {
+			ansi2html = ""
+		}
+		if infos.IsDir() {
+			ansi2html = ""
+		}
+	}
+
 	muxer := http.NewServeMux()
 	muxer.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		pony, err := getPony(r.FormValue("say"))
@@ -22,18 +41,36 @@ func main() {
 		userAgent := strings.ToLower(r.Header.Get("User-Agent"))
 		if strings.HasPrefix(userAgent, "curl") {
 			w.Write(pony)
-		} else {
-			w.Header().Add("Content-type", "text/html; charset=UTF-8")
-			t, _ := template.New("pony").Parse(tpl)
-			htmlPony := terminal.Render(pony)
-			t.Execute(w, template.HTML(string(htmlPony)))
+			return
 		}
+		if ansi2html != "" {
+			htmlPony, err := pony2html(ansi2html, pony)
+			if err == nil {
+				w.Write(htmlPony)
+				return
+			}
+		}
+		w.Header().Add("Content-type", "text/html; charset=UTF-8")
+		t, _ := template.New("pony").Parse(tpl)
+		htmlPony := terminal.Render(pony)
+		t.Execute(w, template.HTML(string(htmlPony)))
 	})
 	muxer.HandleFunc("/terminal.css", func(w http.ResponseWriter, t *http.Request) {
 		w.Header().Add("Content-type", "text/css")
 		io.WriteString(w, css)
 	})
 	http.ListenAndServe("127.0.0.1:8080", muxer)
+}
+
+func pony2html(ansi2html string, pony []byte) ([]byte, error) {
+	cmd := exec.Command(ansi2html)
+	cmd.Stdin = bytes.NewReader(pony)
+	var buf bytes.Buffer
+	err := cmd.Run()
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 func getPony(say string) ([]byte, error) {
