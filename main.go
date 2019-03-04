@@ -2,19 +2,60 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"html/template"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 
 	"github.com/buildkite/terminal-to-html"
+	"github.com/gliderlabs/ssh"
+	"github.com/urfave/cli"
 )
 
 func main() {
+	app := cli.NewApp()
+	app.Name = "pony-as-a-service"
+	app.Usage = "deliver ponies as a service"
+	app.Action = serve
+	app.Flags = []cli.Flag{
+		cli.StringFlag{
+			Name:   "http-addr",
+			Usage:  "HTTP listen address",
+			Value:  "127.0.0.1:7777",
+			EnvVar: "PONY_HTTP_ADDR",
+		},
+		cli.StringFlag{
+			Name:   "ansi2html",
+			Usage:  "ansi2html command path (optional)",
+			Value:  "",
+			EnvVar: "PONY_ANSI2HTML",
+		},
+		cli.BoolFlag{
+			Name:   "ssh",
+			Usage:  "deliver ponies on SSH",
+			EnvVar: "PONY_SSH",
+		},
+		cli.StringFlag{
+			Name:   "ssh-addr",
+			Usage:  "SSH listen address",
+			Value:  "127.0.0.1:2222",
+			EnvVar: "PONY_SSH_ADDR",
+		},
+	}
+	err := app.Run(os.Args)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func serve(c *cli.Context) error {
 	var err error
-	ansi2html := strings.TrimSpace(os.Getenv("ANSI2HTML"))
+	ansi2html := c.GlobalString("ansi2html")
 	if ansi2html == "" {
 		ansi2html, err = exec.LookPath("ansi2html")
 		if err != nil {
@@ -62,7 +103,38 @@ func main() {
 		w.Header().Add("Content-type", "text/css")
 		io.WriteString(w, css)
 	})
-	http.ListenAndServe("127.0.0.1:8080", muxer)
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		err := http.ListenAndServe(c.GlobalString("http-addr"), muxer)
+		if err != nil {
+			log.Println(err)
+		}
+		wg.Done()
+	}()
+
+	if c.GlobalBool("ssh") {
+		ssh.Handle(func(s ssh.Session) {
+			pony, err := getPony("")
+			if err != nil {
+				io.WriteString(s, fmt.Sprintf("failed to deliver pony: %s", err))
+				return
+			}
+			s.Write(pony)
+		})
+		wg.Add(1)
+		go func() {
+			err := ssh.ListenAndServe(c.GlobalString("ssh-addr"), nil, ssh.HostKeyPEM(hostkey))
+			if err != nil {
+				log.Println(err)
+			}
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+
+	return nil
 }
 
 func pony2html(ansi2html string, pony []byte) ([]byte, error) {
