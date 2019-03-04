@@ -55,7 +55,10 @@ func main() {
 		htmlPony := terminal.Render(pony)
 		t.Execute(w, template.HTML(string(htmlPony)))
 	})
-	muxer.HandleFunc("/terminal.css", func(w http.ResponseWriter, t *http.Request) {
+	muxer.HandleFunc("/favicon.ico", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+	})
+	muxer.HandleFunc("/terminal.css", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Add("Content-type", "text/css")
 		io.WriteString(w, css)
 	})
@@ -63,9 +66,10 @@ func main() {
 }
 
 func pony2html(ansi2html string, pony []byte) ([]byte, error) {
+	var buf bytes.Buffer
 	cmd := exec.Command(ansi2html)
 	cmd.Stdin = bytes.NewReader(pony)
-	var buf bytes.Buffer
+	cmd.Stdout = &buf
 	err := cmd.Run()
 	if err != nil {
 		return nil, err
