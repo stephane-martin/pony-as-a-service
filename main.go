@@ -14,6 +14,7 @@ import (
 
 	"github.com/buildkite/terminal-to-html"
 	"github.com/gliderlabs/ssh"
+	"github.com/reiver/go-telnet"
 	"github.com/urfave/cli"
 )
 
@@ -40,11 +41,22 @@ func main() {
 			Usage:  "deliver ponies on SSH",
 			EnvVar: "PONY_SSH",
 		},
+		cli.BoolFlag{
+			Name:   "telnet",
+			Usage:  "deliver ponies on telnet",
+			EnvVar: "PONY_TELNET",
+		},
 		cli.StringFlag{
 			Name:   "ssh-addr",
 			Usage:  "SSH listen address",
 			Value:  "127.0.0.1:2222",
 			EnvVar: "PONY_SSH_ADDR",
+		},
+		cli.StringFlag{
+			Name:   "telnet-addr",
+			Usage:  "telnet listen address",
+			Value:  "127.0.0.1:2323",
+			EnvVar: "PONY_TELNET_ADDR",
 		},
 	}
 	err := app.Run(os.Args)
@@ -132,9 +144,31 @@ func serve(c *cli.Context) error {
 			wg.Done()
 		}()
 	}
+
+	if c.GlobalBool("telnet") {
+		wg.Add(1)
+		go func() {
+			err := telnet.ListenAndServe(c.GlobalString("telnet-addr"), telnetHandler{})
+			if err != nil {
+				log.Println(err)
+			}
+			wg.Done()
+		}()
+	}
+
 	wg.Wait()
 
 	return nil
+}
+
+type telnetHandler struct{}
+
+func (h telnetHandler) ServeTELNET(ctx telnet.Context, w telnet.Writer, r telnet.Reader) {
+	pony, err := getPony("")
+	if err != nil {
+		return
+	}
+	w.Write(pony)
 }
 
 func pony2html(ansi2html string, pony []byte) ([]byte, error) {

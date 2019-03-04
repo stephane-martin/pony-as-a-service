@@ -26,6 +26,22 @@
   version = "v0.1.3"
 
 [[projects]]
+  branch = "master"
+  digest = "1:8ca619fd5ff6877c2b638dcc6f0dafd70dd54117c0ab64456722166edcc7e305"
+  name = "github.com/reiver/go-oi"
+  packages = ["."]
+  pruneopts = "UT"
+  revision = "431c83978379297f04f85f6eb94f129f25ab741d"
+
+[[projects]]
+  branch = "master"
+  digest = "1:5a9ba677807e12c903f0f1b83a7c44b9907fbb82767108ef9d80e58d5e7be70b"
+  name = "github.com/reiver/go-telnet"
+  packages = ["."]
+  pruneopts = "UT"
+  revision = "9ff0b2ab096ebe42bf8e2ffd1366e7ed2223b04c"
+
+[[projects]]
   digest = "1:b24d38b282bacf9791408a080f606370efa3d364e4b5fd9ba0f7b87786d3b679"
   name = "github.com/urfave/cli"
   packages = ["."]
@@ -63,6 +79,7 @@
   input-imports = [
     "github.com/buildkite/terminal-to-html",
     "github.com/gliderlabs/ssh",
+    "github.com/reiver/go-telnet",
     "github.com/urfave/cli",
   ]
   solver-name = "gps-cdcl"
