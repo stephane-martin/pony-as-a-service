@@ -58,6 +58,12 @@ func main() {
 			Value:  "127.0.0.1:2323",
 			EnvVar: "PONY_TELNET_ADDR",
 		},
+		cli.StringFlag{
+			Name:   "hostkey",
+			Usage:  "SSH hostkey's file path",
+			Value:  "ponyhost",
+			EnvVar: "PONY_HOSTKEY",
+		},
 	}
 	err := app.Run(os.Args)
 	if err != nil {
