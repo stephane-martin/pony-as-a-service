@@ -15,6 +15,6 @@ require (
 	github.com/flynn/go-shlex v0.0.0-20150515145356-3f9db97f8568 // indirect
 	github.com/reiver/go-oi v1.0.0 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
-	golang.org/x/crypto v0.0.0-20190228161510-8dd112bcdc25 // indirect
-	golang.org/x/sys v0.0.0-20190303192550-c2f5717e611c // indirect
+	golang.org/x/crypto v0.14.0 // indirect
+	golang.org/x/sys v0.14.0 // indirect
 )
