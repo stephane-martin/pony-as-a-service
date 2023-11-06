@@ -72,12 +72,31 @@ func main() {
 }
 
 func serve(c *cli.Context) error {
-	var err error
-	ansi2html := c.GlobalString("ansi2hgo list -u -m alltml")
+	var (
+		haveFortune bool
+		fortunePath string
+	)
+	if path, err := exec.LookPath("fortune"); err == nil {
+		haveFortune = true
+		fortunePath = path
+	}
+
+	getFortune := func() string {
+		if !haveFortune {
+			return ""
+		}
+		cmd := exec.Command(fortunePath)
+		var buf bytes.Buffer
+		cmd.Stdout = &buf
+		cmd.Run()
+		res := buf.String()
+		return res
+	}
+
+	ansi2html := c.GlobalString("ansi2html")
 	if ansi2html == "" {
-		ansi2html, err = exec.LookPath("ansi2html")
-		if err != nil {
-			ansi2html = ""
+		if path, err := exec.LookPath("ansi2html"); err == nil {
+			ansi2html = path
 		}
 	}
 	if ansi2html != "" {
@@ -89,10 +108,22 @@ func serve(c *cli.Context) error {
 			ansi2html = ""
 		}
 	}
+	var hostkey []byte
+	if c.GlobalBool("ssh") {
+		key, err := os.ReadFile(c.GlobalString("hostkey"))
+		if err != nil {
+			return err
+		}
+		hostkey = key
+	}
 
 	muxer := http.NewServeMux()
 	muxer.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		pony, err := getPony(r.FormValue("say"))
+		say := r.FormValue("say")
+		if say == "" {
+			say = getFortune()
+		}
+		pony, err := getPony(say)
 		if err != nil {
 			log.Println(err)
 			w.WriteHeader(500)
@@ -135,7 +166,7 @@ func serve(c *cli.Context) error {
 
 	if c.GlobalBool("ssh") {
 		ssh.Handle(func(s ssh.Session) {
-			pony, err := getPony("")
+			pony, err := getPony(getFortune())
 			if err != nil {
 				io.WriteString(s, fmt.Sprintf("failed to deliver pony: %s", err))
 				return
