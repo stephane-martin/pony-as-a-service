@@ -12,7 +12,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/buildkite/terminal-to-html"
+	"github.com/buildkite/terminal-to-html/v3"
 	"github.com/gliderlabs/ssh"
 	"github.com/reiver/go-telnet"
 	"github.com/urfave/cli"
@@ -67,7 +67,7 @@ func main() {
 
 func serve(c *cli.Context) error {
 	var err error
-	ansi2html := c.GlobalString("ansi2html")
+	ansi2html := c.GlobalString("ansi2hgo list -u -m alltml")
 	if ansi2html == "" {
 		ansi2html, err = exec.LookPath("ansi2html")
 		if err != nil {
@@ -88,6 +88,7 @@ func serve(c *cli.Context) error {
 	muxer.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		pony, err := getPony(r.FormValue("say"))
 		if err != nil {
+			log.Println(err)
 			w.WriteHeader(500)
 			return
 		}
