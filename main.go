@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -67,8 +68,8 @@ func main() {
 	}
 }
 
-func sshHandler(s ssh.Session, c *cli.Context) {
-	if s.User() != c.GlobalString("ponyuser") {
+func sshHandler(s ssh.Session, ponyUser string, openaiApiKey string) {
+	if s.User() != ponyUser {
 		return
 	}
 	pty, winCh, isPty := s.Pty()
@@ -76,7 +77,7 @@ func sshHandler(s ssh.Session, c *cli.Context) {
 		io.WriteString(s, "No PTY requested.\n")
 		return
 	}
-	process := newProcessor(c.GlobalString("openai-api-key"))
+	process := newProcessor(openaiApiKey)
 
 	// display the pony
 	pony, err := process.getPony(pty.Window.Width)
@@ -96,7 +97,7 @@ func sshHandler(s ssh.Session, c *cli.Context) {
 		line, err := term.ReadLine()
 		if err != nil {
 			// err == io.EOF when user presses ctrl+d
-			if err != io.EOF {
+			if !errors.Is(err, io.EOF) {
 				fmt.Println(err)
 			}
 			break
@@ -104,13 +105,11 @@ func sshHandler(s ssh.Session, c *cli.Context) {
 		if line == "quit" {
 			break
 		}
-		response, err := process.processUserLine(line)
-		if err != nil {
+		if err := process.processUserLine(context.Background(), s, line); err != nil {
 			log.Printf("failed to process user line: %s", err)
 			io.WriteString(s, "Sorry, I don't know what to say. Bye.\n")
 			break
 		}
-		io.WriteString(s, response)
 		io.WriteString(s, "\n\n")
 	}
 
@@ -131,7 +130,7 @@ func serve(c *cli.Context) error {
 	var wg sync.WaitGroup
 
 	ssh.Handle(func(s ssh.Session) {
-		sshHandler(s, c)
+		sshHandler(s, c.GlobalString("ponyuser"), c.GlobalString("openai-api-key"))
 	})
 
 	wg.Add(1)
@@ -196,33 +195,40 @@ func (p *processor) addMessage(msg openai.ChatCompletionMessage) {
 	}
 }
 
-func (p *processor) processUserLine(line string) (string, error) {
+func (p *processor) processUserLine(ctx context.Context, s ssh.Session, line string) error {
 	userMessage := openai.ChatCompletionMessage{
 		Role:    openai.ChatMessageRoleUser,
 		Content: line,
 	}
 	p.addMessage(userMessage)
-	resp, err := p.client.CreateChatCompletion(
-		context.Background(),
-		openai.ChatCompletionRequest{
-			Model:          openai.GPT3Dot5Turbo1106,
-			Messages:       p.previousMesssages,
-			ResponseFormat: p.textReponseFormat,
-		},
-	)
+	request := openai.ChatCompletionRequest{
+		Model:          openai.GPT3Dot5Turbo1106,
+		Messages:       p.previousMesssages,
+		ResponseFormat: p.textReponseFormat,
+	}
+	stream, err := p.client.CreateChatCompletionStream(ctx, request)
 	if err != nil {
-		return "", fmt.Errorf("failed to create chat completion: %w", err)
+		return fmt.Errorf("failed to create chat completion stream: %w", err)
 	}
-	first := resp.Choices[0]
-	if first.FinishReason != openai.FinishReasonStop {
-		return "", fmt.Errorf("failed to create chat completion because of: %s", first.FinishReason)
+	defer stream.Close()
+	var fullResponse strings.Builder
+	for {
+		response, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("failed to receive chat completion stream: %w", err)
+		}
+		delta := response.Choices[0].Delta.Content
+		fullResponse.WriteString(delta)
+		io.WriteString(s, delta)
 	}
-	content := strings.TrimSpace(first.Message.Content)
 	p.addMessage(openai.ChatCompletionMessage{
 		Role:    openai.ChatMessageRoleAssistant,
-		Content: content,
+		Content: fullResponse.String(),
 	})
-	return strings.TrimSpace(first.Message.Content), nil
+	return nil
 
 }
 
