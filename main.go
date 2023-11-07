@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/gliderlabs/ssh"
 	"github.com/joho/godotenv"
@@ -80,7 +81,8 @@ func sshHandler(s ssh.Session, ponyUser string, openaiApiKey string) {
 	process := newProcessor(openaiApiKey)
 
 	// display the pony
-	pony, err := process.getPony(pty.Window.Width)
+	var currentWidth int32 = int32(pty.Window.Width)
+	pony, err := process.getPony(int(currentWidth))
 	if err != nil {
 		log.Printf("failed to deliver pony: %s", err)
 		return
@@ -91,6 +93,15 @@ func sshHandler(s ssh.Session, ponyUser string, openaiApiKey string) {
 	// set up the terminal
 	term := term.NewTerminal(s, "> ")
 	term.SetSize(pty.Window.Width, pty.Window.Height)
+
+	// consume the window size changes
+	// it is important to do so to prevent a deadlock on that channel
+	go func() {
+		for win := range winCh {
+			term.SetSize(win.Width, win.Height)
+			atomic.StoreInt32(&currentWidth, int32(win.Width))
+		}
+	}()
 
 	// conversation loop
 	for {
@@ -105,19 +116,14 @@ func sshHandler(s ssh.Session, ponyUser string, openaiApiKey string) {
 		if line == "quit" {
 			break
 		}
-		if err := process.processUserLine(context.Background(), s, line); err != nil {
+		width := int(atomic.LoadInt32(&currentWidth))
+		if err := process.processUserLine(s.Context(), s, line, width); err != nil {
 			log.Printf("failed to process user line: %s", err)
 			io.WriteString(s, "Sorry, I don't know what to say. Bye.\n")
 			break
 		}
 		io.WriteString(s, "\n\n")
 	}
-
-	go func() {
-		for win := range winCh {
-			term.SetSize(win.Height, win.Width)
-		}
-	}()
 }
 
 func serve(c *cli.Context) error {
@@ -195,7 +201,7 @@ func (p *processor) addMessage(msg openai.ChatCompletionMessage) {
 	}
 }
 
-func (p *processor) processUserLine(ctx context.Context, s ssh.Session, line string) error {
+func (p *processor) processUserLine(ctx context.Context, s ssh.Session, line string, width int) error {
 	userMessage := openai.ChatCompletionMessage{
 		Role:    openai.ChatMessageRoleUser,
 		Content: line,
@@ -204,14 +210,17 @@ func (p *processor) processUserLine(ctx context.Context, s ssh.Session, line str
 	request := openai.ChatCompletionRequest{
 		Model:          openai.GPT3Dot5Turbo1106,
 		Messages:       p.previousMesssages,
-		ResponseFormat: p.textReponseFormat,
+		ResponseFormat: &p.textReponseFormat,
 	}
 	stream, err := p.client.CreateChatCompletionStream(ctx, request)
 	if err != nil {
 		return fmt.Errorf("failed to create chat completion stream: %w", err)
 	}
 	defer stream.Close()
-	var fullResponse strings.Builder
+	w := writer{
+		maxWidth: width,
+		session:  s,
+	}
 	for {
 		response, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
@@ -220,16 +229,29 @@ func (p *processor) processUserLine(ctx context.Context, s ssh.Session, line str
 		if err != nil {
 			return fmt.Errorf("failed to receive chat completion stream: %w", err)
 		}
-		delta := response.Choices[0].Delta.Content
-		fullResponse.WriteString(delta)
-		io.WriteString(s, delta)
+		w.writeChunk(response.Choices[0].Delta.Content)
 	}
 	p.addMessage(openai.ChatCompletionMessage{
 		Role:    openai.ChatMessageRoleAssistant,
-		Content: fullResponse.String(),
+		Content: w.getFullResponse(),
 	})
 	return nil
+}
 
+// TODO: ensure the response from OpenAI are correctly wrapped based on the terminal width
+type writer struct {
+	fullResponse strings.Builder
+	maxWidth     int
+	session      ssh.Session
+}
+
+func (w *writer) writeChunk(chunk string) {
+	w.fullResponse.WriteString(chunk)
+	io.WriteString(w.session, chunk)
+}
+
+func (w *writer) getFullResponse() string {
+	return w.fullResponse.String()
 }
 
 func (p *processor) getPony(width int) ([]byte, error) {
