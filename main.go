@@ -45,9 +45,20 @@ func main() {
 		cli.StringFlag{
 			Name:     "openai-api-key",
 			Usage:    "OpenAI API key",
-			Value:    "",
 			EnvVar:   "OPENAI_API_KEY",
 			Required: true,
+		},
+		cli.StringFlag{
+			Name:     "ponyuser",
+			Usage:    "SSH pony user for authentication",
+			EnvVar:   "PONY_SSH_USER",
+			Required: true,
+		},
+		cli.StringFlag{
+			Name:   "ponypass",
+			Usage:  "SSH pony password for authentication",
+			EnvVar: "PONY_SSH_PASS",
+			Value:  "",
 		},
 	}
 	err := app.Run(os.Args)
@@ -56,66 +67,84 @@ func main() {
 	}
 }
 
-func serve(c *cli.Context) error {
+func sshHandler(s ssh.Session, c *cli.Context) {
+	if s.User() != c.GlobalString("ponyuser") {
+		return
+	}
+	pty, winCh, isPty := s.Pty()
+	if !isPty {
+		io.WriteString(s, "No PTY requested.\n")
+		return
+	}
+	process := newProcessor(c.GlobalString("openai-api-key"))
 
+	// display the pony
+	pony, err := process.getPony(pty.Window.Width)
+	if err != nil {
+		log.Printf("failed to deliver pony: %s", err)
+		return
+	}
+	s.Write(pony)
+	io.WriteString(s, "\n")
+
+	// set up the terminal
+	term := term.NewTerminal(s, "> ")
+	term.SetSize(pty.Window.Width, pty.Window.Height)
+
+	// conversation loop
+	for {
+		line, err := term.ReadLine()
+		if err != nil {
+			// err == io.EOF when user presses ctrl+d
+			if err != io.EOF {
+				fmt.Println(err)
+			}
+			break
+		}
+		if line == "quit" {
+			break
+		}
+		response, err := process.processUserLine(line)
+		if err != nil {
+			log.Printf("failed to process user line: %s", err)
+			io.WriteString(s, "Sorry, I don't know what to say. Bye.\n")
+			break
+		}
+		io.WriteString(s, response)
+		io.WriteString(s, "\n\n")
+	}
+
+	go func() {
+		for win := range winCh {
+			term.SetSize(win.Height, win.Width)
+		}
+	}()
+}
+
+func serve(c *cli.Context) error {
 	hostkey, err := os.ReadFile(c.GlobalString("hostkey"))
 	if err != nil {
 		return err
 	}
+	requiredPass := c.GlobalString("ponypass")
 
 	var wg sync.WaitGroup
 
 	ssh.Handle(func(s ssh.Session) {
-		pty, winCh, isPty := s.Pty()
-		if !isPty {
-			io.WriteString(s, "No PTY requested.\n")
-			return
-		}
-		process := newProcessor(c.GlobalString("openai-api-key"))
-		// display the pony
-		pony, err := process.getPony(pty.Window.Width)
-		if err != nil {
-			log.Printf("failed to deliver pony: %s", err)
-			return
-		}
-		s.Write(pony)
-		io.WriteString(s, "\n")
-
-		// start the conversation
-
-		term := term.NewTerminal(s, "> ")
-		for {
-			line, err := term.ReadLine()
-			if err != nil {
-				if err != io.EOF {
-					fmt.Println(err)
-				}
-				break
-			}
-			if line == "quit" {
-				break
-			}
-			response, err := process.processUserLine(line)
-			if err != nil {
-				log.Printf("failed to process user line: %s", err)
-				io.WriteString(s, "Sorry, I don't know what to say. Bye.\n")
-				break
-			}
-			io.WriteString(s, response)
-			io.WriteString(s, "\n\n")
-		}
-
-		go func() {
-			for win := range winCh {
-				term.SetSize(win.Height, win.Width)
-			}
-		}()
-
+		sshHandler(s, c)
 	})
+
 	wg.Add(1)
 	go func() {
-		err := ssh.ListenAndServe(c.GlobalString("ssh-addr"), nil, ssh.HostKeyPEM(hostkey))
-		if err != nil {
+		opts := []ssh.Option{
+			ssh.HostKeyPEM(hostkey),
+		}
+		if requiredPass != "" {
+			opts = append(opts, ssh.PasswordAuth(func(ctx ssh.Context, pass string) bool {
+				return pass == requiredPass
+			}))
+		}
+		if err := ssh.ListenAndServe(c.GlobalString("ssh-addr"), nil, opts...); err != nil {
 			log.Println(err)
 		}
 		wg.Done()
