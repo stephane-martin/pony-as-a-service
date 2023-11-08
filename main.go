@@ -71,11 +71,13 @@ func main() {
 
 func sshHandler(s ssh.Session, ponyUser string, openaiApiKey string) {
 	if s.User() != ponyUser {
+		_ = s.Exit(1)
 		return
 	}
 	pty, winCh, isPty := s.Pty()
 	if !isPty {
-		io.WriteString(s, "No PTY requested.\n")
+		_, _ = io.WriteString(s, "No PTY requested.\n")
+		s.Close()
 		return
 	}
 	process := newProcessor(openaiApiKey)
@@ -85,20 +87,25 @@ func sshHandler(s ssh.Session, ponyUser string, openaiApiKey string) {
 	pony, err := process.getPony(int(currentWidth))
 	if err != nil {
 		log.Printf("failed to deliver pony: %s", err)
+		s.Close()
 		return
 	}
-	s.Write(pony)
-	io.WriteString(s, "\n")
+	if _, err := s.Write(pony); err != nil {
+		log.Printf("failed to write pony: %s", err)
+		s.Close()
+		return
+	}
+	_, _ = io.WriteString(s, "\n")
 
 	// set up the terminal
 	term := term.NewTerminal(s, "> ")
-	term.SetSize(pty.Window.Width, pty.Window.Height)
+	_ = term.SetSize(pty.Window.Width, pty.Window.Height)
 
 	// consume the window size changes
 	// it is important to do so to prevent a deadlock on that channel
 	go func() {
 		for win := range winCh {
-			term.SetSize(win.Width, win.Height)
+			_ = term.SetSize(win.Width, win.Height)
 			atomic.StoreInt32(&currentWidth, int32(win.Width))
 		}
 	}()
@@ -111,18 +118,21 @@ func sshHandler(s ssh.Session, ponyUser string, openaiApiKey string) {
 			if !errors.Is(err, io.EOF) {
 				fmt.Println(err)
 			}
-			break
+			s.Close()
+			return
 		}
 		if line == "quit" {
-			break
+			s.Close()
+			return
 		}
 		width := int(atomic.LoadInt32(&currentWidth))
 		if err := process.processUserLine(s.Context(), s, line, width); err != nil {
 			log.Printf("failed to process user line: %s", err)
-			io.WriteString(s, "Sorry, I don't know what to say. Bye.\n")
-			break
+			_, _ = io.WriteString(s, "Sorry, I don't know what to say. Bye.\n")
+			_ = s.Exit(2)
+			return
 		}
-		io.WriteString(s, "\n\n")
+		_, _ = io.WriteString(s, "\n\n")
 	}
 }
 
@@ -229,7 +239,9 @@ func (p *processor) processUserLine(ctx context.Context, s ssh.Session, line str
 		if err != nil {
 			return fmt.Errorf("failed to receive chat completion stream: %w", err)
 		}
-		w.writeChunk(response.Choices[0].Delta.Content)
+		if err := w.writeChunk(response.Choices[0].Delta.Content); err != nil {
+			return fmt.Errorf("failed to write chunk: %w", err)
+		}
 	}
 	p.addMessage(openai.ChatCompletionMessage{
 		Role:    openai.ChatMessageRoleAssistant,
@@ -245,9 +257,10 @@ type writer struct {
 	session      ssh.Session
 }
 
-func (w *writer) writeChunk(chunk string) {
+func (w *writer) writeChunk(chunk string) error {
 	w.fullResponse.WriteString(chunk)
-	io.WriteString(w.session, chunk)
+	_, err := io.WriteString(w.session, chunk)
+	return err
 }
 
 func (w *writer) getFullResponse() string {
