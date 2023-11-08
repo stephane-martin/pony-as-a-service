@@ -8,12 +8,15 @@ import (
 	"io"
 	"log"
 	"math/rand"
+	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 
 	"github.com/gliderlabs/ssh"
 	"github.com/joho/godotenv"
@@ -70,6 +73,74 @@ func main() {
 	}
 }
 
+func serve(c *cli.Context) error {
+	hostkey, err := os.ReadFile(c.GlobalString("hostkey"))
+	if err != nil {
+		return fmt.Errorf("failed to read SSH host key: %w", err)
+	}
+	// capture signals
+	sigchan := make(chan os.Signal, 1)
+	signal.Notify(sigchan, os.Interrupt, syscall.SIGTERM)
+
+	// create a global context to manage the lifetime of all the services
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// when a signal is received, cancel the context
+	go func() {
+		<-sigchan
+		cancel()
+	}()
+
+	requiredPass := c.GlobalString("ponypass")
+
+	sshListenAddr := c.GlobalString("ssh-addr")
+	sshListener, err := net.Listen("tcp", sshListenAddr)
+	if err != nil {
+		return fmt.Errorf("failed to listen on %s: %w", sshListenAddr, err)
+	}
+	defer sshListener.Close()
+
+	opts := []ssh.Option{
+		ssh.HostKeyPEM(hostkey),
+	}
+	if requiredPass != "" {
+		opts = append(opts, ssh.PasswordAuth(func(ctx ssh.Context, pass string) bool {
+			return pass == requiredPass
+		}))
+	}
+	// the SSH handler to be called when a new SSH connection is opened
+	h := func(s ssh.Session) {
+		sshHandler(s, c.GlobalString("ponyuser"), c.GlobalString("openai-api-key"))
+	}
+
+	sshServer := &ssh.Server{Handler: h}
+	for _, option := range opts {
+		if err := sshServer.SetOption(option); err != nil {
+			return err
+		}
+	}
+
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		<-ctx.Done()
+		sshServer.Close()
+		wg.Done()
+	}()
+
+	wg.Add(1)
+	go func() {
+		if err := sshServer.Serve(sshListener); err != nil {
+			log.Println(err)
+		}
+		wg.Done()
+	}()
+	wg.Wait()
+
+	return nil
+}
+
 func sshHandler(s ssh.Session, ponyUser string, openaiApiKey string) {
 	if s.User() != ponyUser {
 		_ = s.Exit(1)
@@ -81,7 +152,7 @@ func sshHandler(s ssh.Session, ponyUser string, openaiApiKey string) {
 		s.Close()
 		return
 	}
-	process := newProcessor(openaiApiKey, s, pty.Window.Width)
+	process := newSSHProcessor(openaiApiKey, s, pty.Window.Width)
 
 	// display the pony
 	pony, err := process.getPony()
@@ -125,7 +196,7 @@ func sshHandler(s ssh.Session, ponyUser string, openaiApiKey string) {
 			s.Close()
 			return
 		}
-		if err := process.processUserLine(s.Context(), line); err != nil {
+		if err := ProcessUserLine(s.Context(), process, line); err != nil {
 			log.Printf("failed to process user line: %s", err)
 			_, _ = io.WriteString(s, "Sorry, I don't know what to say. Bye.\n")
 			_ = s.Exit(2)
@@ -134,40 +205,7 @@ func sshHandler(s ssh.Session, ponyUser string, openaiApiKey string) {
 	}
 }
 
-func serve(c *cli.Context) error {
-	hostkey, err := os.ReadFile(c.GlobalString("hostkey"))
-	if err != nil {
-		return err
-	}
-	requiredPass := c.GlobalString("ponypass")
-
-	var wg sync.WaitGroup
-
-	ssh.Handle(func(s ssh.Session) {
-		sshHandler(s, c.GlobalString("ponyuser"), c.GlobalString("openai-api-key"))
-	})
-
-	wg.Add(1)
-	go func() {
-		opts := []ssh.Option{
-			ssh.HostKeyPEM(hostkey),
-		}
-		if requiredPass != "" {
-			opts = append(opts, ssh.PasswordAuth(func(ctx ssh.Context, pass string) bool {
-				return pass == requiredPass
-			}))
-		}
-		if err := ssh.ListenAndServe(c.GlobalString("ssh-addr"), nil, opts...); err != nil {
-			log.Println(err)
-		}
-		wg.Done()
-	}()
-	wg.Wait()
-
-	return nil
-}
-
-type processor struct {
+type sshProcessor struct {
 	openaiApiKey         string
 	session              ssh.Session
 	ponyCodeName         string
@@ -175,43 +213,49 @@ type processor struct {
 	client               *openai.Client
 	previousMesssages    []openai.ChatCompletionMessage
 	maxPreviousMesssages int
-	textReponseFormat    openai.ChatCompletionResponseFormat
 	width                *int32
 }
 
-func newProcessor(openaiApiKey string, session ssh.Session, initialWidth int) *processor {
+func newSSHProcessor(openaiApiKey string, session ssh.Session, initialWidth int) *sshProcessor {
 	ponyCodeName := listOfPonies[rand.Intn(len(listOfPonies))]
 	caser := cases.Title(language.English)
 	ponyName := caser.String(ponyCodeName)
 	client := openai.NewClient(openaiApiKey)
-	message := openai.ChatCompletionMessage{
+	initMessage := openai.ChatCompletionMessage{
 		Role:    openai.ChatMessageRoleSystem,
 		Content: fmt.Sprintf(PROMPT_TEMPLATE, ponyName),
 	}
-	proc := &processor{
+	proc := &sshProcessor{
 		openaiApiKey:         openaiApiKey,
 		session:              session,
 		ponyCodeName:         ponyCodeName,
 		ponyName:             ponyName,
 		client:               client,
-		textReponseFormat:    openai.ChatCompletionResponseFormat{Type: openai.ChatCompletionResponseFormatTypeText},
 		maxPreviousMesssages: 20,
 		width:                new(int32),
 	}
 	*proc.width = int32(initialWidth)
-	proc.addMessage(message)
+	proc.AddMessage(initMessage)
 	return proc
 }
 
-func (p *processor) getWidth() int {
+func (p *sshProcessor) GetClient() *openai.Client {
+	return p.client
+}
+
+func (p *sshProcessor) GetPreviousMessages() []openai.ChatCompletionMessage {
+	return p.previousMesssages
+}
+
+func (p *sshProcessor) getWidth() int {
 	return int(atomic.LoadInt32(p.width))
 }
 
-func (p *processor) setWidth(w int) {
+func (p *sshProcessor) setWidth(w int) {
 	atomic.StoreInt32(p.width, int32(w))
 }
 
-func (p *processor) addMessage(msg openai.ChatCompletionMessage) {
+func (p *sshProcessor) AddMessage(msg openai.ChatCompletionMessage) {
 	p.previousMesssages = append(p.previousMesssages, msg)
 	if len(p.previousMesssages) > p.maxPreviousMesssages {
 		// keep the initial prompt
@@ -222,41 +266,9 @@ func (p *processor) addMessage(msg openai.ChatCompletionMessage) {
 	}
 }
 
-func (p *processor) processUserLine(ctx context.Context, line string) error {
-	userMessage := openai.ChatCompletionMessage{
-		Role:    openai.ChatMessageRoleUser,
-		Content: line,
-	}
-	p.addMessage(userMessage)
-	req := openai.ChatCompletionRequest{
-		Model:          openai.GPT3Dot5Turbo1106,
-		Messages:       p.previousMesssages,
-		ResponseFormat: &p.textReponseFormat,
-	}
-	resp, err := p.client.CreateChatCompletion(ctx, req)
-	if err != nil {
-		return fmt.Errorf("failed to create chat completion: %w", err)
-	}
-	first := resp.Choices[0]
-	if first.FinishReason != openai.FinishReasonStop {
-		return fmt.Errorf("unexpected finish reason: %s", first.FinishReason)
-	}
-	if err := p.writeResponse(first); err != nil {
-		return fmt.Errorf("failed to write response: %w", err)
-	}
-
-	p.addMessage(openai.ChatCompletionMessage{
-		Role:    openai.ChatMessageRoleAssistant,
-		Content: first.Message.Content,
-	})
-
-	return nil
-}
-
-func (p *processor) writeResponse(choice openai.ChatCompletionChoice) error {
-	respContent := strings.TrimSpace(choice.Message.Content)
-	respContentWrapped := wordwrap.String(respContent, p.getWidth()-4)
-	lines := strings.Split(respContentWrapped, "\n")
+func (p *sshProcessor) WriteResponse(resp string) error {
+	respWrapped := wordwrap.String(resp, p.getWidth()-4)
+	lines := strings.Split(respWrapped, "\n")
 	var b bytes.Buffer
 	b.WriteString("\n")
 	for _, line := range lines {
@@ -271,7 +283,7 @@ func (p *processor) writeResponse(choice openai.ChatCompletionChoice) error {
 	return nil
 }
 
-func (p *processor) getPony() ([]byte, error) {
+func (p *sshProcessor) getPony() ([]byte, error) {
 	say := fmt.Sprintf("Hello! My name is %s!", p.ponyName)
 	cmd := exec.Command("ponysay", "-W", strconv.Itoa(p.getWidth()), "-X", "-b", "ascii", "--pony", p.ponyCodeName, say)
 	var buf bytes.Buffer
