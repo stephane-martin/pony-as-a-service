@@ -17,6 +17,7 @@ import (
 
 	"github.com/gliderlabs/ssh"
 	"github.com/joho/godotenv"
+	"github.com/muesli/reflow/wordwrap"
 	"github.com/sashabaranov/go-openai"
 	"github.com/urfave/cli"
 	"golang.org/x/term"
@@ -80,11 +81,10 @@ func sshHandler(s ssh.Session, ponyUser string, openaiApiKey string) {
 		s.Close()
 		return
 	}
-	process := newProcessor(openaiApiKey)
+	process := newProcessor(openaiApiKey, s, pty.Window.Width)
 
 	// display the pony
-	var currentWidth int32 = int32(pty.Window.Width)
-	pony, err := process.getPony(int(currentWidth))
+	pony, err := process.getPony()
 	if err != nil {
 		log.Printf("failed to deliver pony: %s", err)
 		s.Close()
@@ -98,7 +98,7 @@ func sshHandler(s ssh.Session, ponyUser string, openaiApiKey string) {
 	_, _ = io.WriteString(s, "\n")
 
 	// set up the terminal
-	term := term.NewTerminal(s, "> ")
+	term := term.NewTerminal(s, " > ")
 	_ = term.SetSize(pty.Window.Width, pty.Window.Height)
 
 	// consume the window size changes
@@ -106,7 +106,7 @@ func sshHandler(s ssh.Session, ponyUser string, openaiApiKey string) {
 	go func() {
 		for win := range winCh {
 			_ = term.SetSize(win.Width, win.Height)
-			atomic.StoreInt32(&currentWidth, int32(win.Width))
+			process.setWidth(win.Width)
 		}
 	}()
 
@@ -125,14 +125,12 @@ func sshHandler(s ssh.Session, ponyUser string, openaiApiKey string) {
 			s.Close()
 			return
 		}
-		width := int(atomic.LoadInt32(&currentWidth))
-		if err := process.processUserLine(s.Context(), s, line, width); err != nil {
+		if err := process.processUserLine(s.Context(), line); err != nil {
 			log.Printf("failed to process user line: %s", err)
 			_, _ = io.WriteString(s, "Sorry, I don't know what to say. Bye.\n")
 			_ = s.Exit(2)
 			return
 		}
-		_, _ = io.WriteString(s, "\n\n")
 	}
 }
 
@@ -171,15 +169,17 @@ func serve(c *cli.Context) error {
 
 type processor struct {
 	openaiApiKey         string
+	session              ssh.Session
 	ponyCodeName         string
 	ponyName             string
 	client               *openai.Client
 	previousMesssages    []openai.ChatCompletionMessage
 	maxPreviousMesssages int
 	textReponseFormat    openai.ChatCompletionResponseFormat
+	width                *int32
 }
 
-func newProcessor(openaiApiKey string) *processor {
+func newProcessor(openaiApiKey string, session ssh.Session, initialWidth int) *processor {
 	ponyCodeName := listOfPonies[rand.Intn(len(listOfPonies))]
 	caser := cases.Title(language.English)
 	ponyName := caser.String(ponyCodeName)
@@ -190,14 +190,25 @@ func newProcessor(openaiApiKey string) *processor {
 	}
 	proc := &processor{
 		openaiApiKey:         openaiApiKey,
+		session:              session,
 		ponyCodeName:         ponyCodeName,
 		ponyName:             ponyName,
 		client:               client,
 		textReponseFormat:    openai.ChatCompletionResponseFormat{Type: openai.ChatCompletionResponseFormatTypeText},
 		maxPreviousMesssages: 20,
+		width:                new(int32),
 	}
+	*proc.width = int32(initialWidth)
 	proc.addMessage(message)
 	return proc
+}
+
+func (p *processor) getWidth() int {
+	return int(atomic.LoadInt32(p.width))
+}
+
+func (p *processor) setWidth(w int) {
+	atomic.StoreInt32(p.width, int32(w))
 }
 
 func (p *processor) addMessage(msg openai.ChatCompletionMessage) {
@@ -211,65 +222,58 @@ func (p *processor) addMessage(msg openai.ChatCompletionMessage) {
 	}
 }
 
-func (p *processor) processUserLine(ctx context.Context, s ssh.Session, line string, width int) error {
+func (p *processor) processUserLine(ctx context.Context, line string) error {
 	userMessage := openai.ChatCompletionMessage{
 		Role:    openai.ChatMessageRoleUser,
 		Content: line,
 	}
 	p.addMessage(userMessage)
-	request := openai.ChatCompletionRequest{
+	req := openai.ChatCompletionRequest{
 		Model:          openai.GPT3Dot5Turbo1106,
 		Messages:       p.previousMesssages,
 		ResponseFormat: &p.textReponseFormat,
 	}
-	stream, err := p.client.CreateChatCompletionStream(ctx, request)
+	resp, err := p.client.CreateChatCompletion(ctx, req)
 	if err != nil {
-		return fmt.Errorf("failed to create chat completion stream: %w", err)
+		return fmt.Errorf("failed to create chat completion: %w", err)
 	}
-	defer stream.Close()
-	w := writer{
-		maxWidth: width,
-		session:  s,
+	first := resp.Choices[0]
+	if first.FinishReason != openai.FinishReasonStop {
+		return fmt.Errorf("unexpected finish reason: %s", first.FinishReason)
 	}
-	for {
-		response, err := stream.Recv()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("failed to receive chat completion stream: %w", err)
-		}
-		if err := w.writeChunk(response.Choices[0].Delta.Content); err != nil {
-			return fmt.Errorf("failed to write chunk: %w", err)
-		}
+	if err := p.writeResponse(first); err != nil {
+		return fmt.Errorf("failed to write response: %w", err)
 	}
+
 	p.addMessage(openai.ChatCompletionMessage{
 		Role:    openai.ChatMessageRoleAssistant,
-		Content: w.getFullResponse(),
+		Content: first.Message.Content,
 	})
+
 	return nil
 }
 
-// TODO: ensure the response from OpenAI are correctly wrapped based on the terminal width
-type writer struct {
-	fullResponse strings.Builder
-	maxWidth     int
-	session      ssh.Session
+func (p *processor) writeResponse(choice openai.ChatCompletionChoice) error {
+	respContent := strings.TrimSpace(choice.Message.Content)
+	respContentWrapped := wordwrap.String(respContent, p.getWidth()-4)
+	lines := strings.Split(respContentWrapped, "\n")
+	var b bytes.Buffer
+	b.WriteString("\n")
+	for _, line := range lines {
+		b.WriteString(" ")
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
+	if _, err := b.WriteTo(p.session); err != nil {
+		return fmt.Errorf("failed to write response: %w", err)
+	}
+	return nil
 }
 
-func (w *writer) writeChunk(chunk string) error {
-	w.fullResponse.WriteString(chunk)
-	_, err := io.WriteString(w.session, chunk)
-	return err
-}
-
-func (w *writer) getFullResponse() string {
-	return w.fullResponse.String()
-}
-
-func (p *processor) getPony(width int) ([]byte, error) {
+func (p *processor) getPony() ([]byte, error) {
 	say := fmt.Sprintf("Hello! My name is %s!", p.ponyName)
-	cmd := exec.Command("ponysay", "-W", strconv.Itoa(width), "-X", "-b", "ascii", "--pony", p.ponyCodeName, say)
+	cmd := exec.Command("ponysay", "-W", strconv.Itoa(p.getWidth()), "-X", "-b", "ascii", "--pony", p.ponyCodeName, say)
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	if err := cmd.Run(); err != nil {
