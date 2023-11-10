@@ -2,11 +2,11 @@ package main
 
 import "github.com/urfave/cli"
 
-func makeApp() *cli.App {
+func makeApp(action cli.ActionFunc) *cli.App {
 	app := cli.NewApp()
 	app.Name = "pony-as-a-service"
 	app.Usage = "deliver ponies as a service"
-	app.Action = serve
+	app.Action = action
 	app.Flags = []cli.Flag{
 		cli.StringFlag{
 			Name:   "ssh-addr",
@@ -55,6 +55,11 @@ func makeApp() *cli.App {
 			Usage:  "SSH pony password for authentication",
 			EnvVar: "PONY_SSH_PASS",
 			Value:  "",
+		},
+		cli.BoolFlag{
+			Name:   "syslog",
+			Usage:  "Log to syslog",
+			EnvVar: "PONY_SYSLOG",
 		},
 	}
 	return app

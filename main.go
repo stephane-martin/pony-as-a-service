@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/syslog"
 	"math/rand"
 	"net"
 	"os"
@@ -30,11 +31,14 @@ import (
 
 const MODEL = openai.GPT3Dot5Turbo16K
 
+var logger = log.New(os.Stderr, "ponies ", 0)
+
 func main() {
 	_ = godotenv.Load()
-	app := makeApp()
+	app := makeApp(serve)
 	if err := app.Run(os.Args); err != nil {
-		log.Fatal(err)
+		logger.Println(err)
+		os.Exit(1)
 	}
 }
 
@@ -88,14 +92,34 @@ func makeOpenAIClient(d *deploymentOptions) *openai.Client {
 }
 
 func serve(c *cli.Context) error {
+	if c.GlobalBool("syslog") {
+		syslogger, err := syslog.New(syslog.LOG_INFO|syslog.LOG_LOCAL3, "ponies")
+		if err != nil {
+			return fmt.Errorf("failed to connect to syslog: %w", err)
+		}
+		logger = log.New(syslogger, "ponies ", 0)
+	}
+	// read the SSH host key
 	hostkey, err := os.ReadFile(c.GlobalString("hostkey"))
 	if err != nil {
 		return fmt.Errorf("failed to read SSH host key: %w", err)
 	}
+
+	// read the deployment options from the environment / command line
 	dopts, err := newDeploymentOptions(c)
 	if err != nil {
 		return err
 	}
+
+	// listen on the SSH port
+	sshListenAddr := c.GlobalString("ssh-addr")
+	sshListener, err := net.Listen("tcp", sshListenAddr)
+	if err != nil {
+		return fmt.Errorf("failed to listen on %s: %w", sshListenAddr, err)
+	}
+	defer sshListener.Close()
+	logger.Printf("listening on %s", sshListenAddr)
+
 	// capture signals
 	sigchan := make(chan os.Signal, 1)
 	signal.Notify(sigchan, os.Interrupt, syscall.SIGTERM)
@@ -110,13 +134,6 @@ func serve(c *cli.Context) error {
 	}()
 
 	requiredPass := c.GlobalString("ponypass")
-
-	sshListenAddr := c.GlobalString("ssh-addr")
-	sshListener, err := net.Listen("tcp", sshListenAddr)
-	if err != nil {
-		return fmt.Errorf("failed to listen on %s: %w", sshListenAddr, err)
-	}
-	defer sshListener.Close()
 
 	opts := []ssh.Option{
 		ssh.HostKeyPEM(hostkey),
@@ -149,8 +166,9 @@ func serve(c *cli.Context) error {
 
 	wg.Add(1)
 	go func() {
+		logger.Println("ssh server starting")
 		if err := sshServer.Serve(sshListener); err != nil {
-			log.Println(err)
+			logger.Println(err)
 		}
 		wg.Done()
 	}()
@@ -160,31 +178,27 @@ func serve(c *cli.Context) error {
 }
 
 func sshHandler(s ssh.Session, ponyUser string, opts *deploymentOptions) {
+	logger.Printf("new connection from %s@%s", s.User(), s.RemoteAddr())
 	if s.User() != ponyUser {
+		logger.Printf("user %s is not allowed to log in", s.User())
 		_ = s.Exit(1)
 		return
 	}
 	pty, winCh, isPty := s.Pty()
 	if !isPty {
 		_, _ = io.WriteString(s, "No PTY requested.\n")
+		logger.Println("no PTY requested")
 		s.Close()
 		return
 	}
 	process := newSSHProcessor(opts, s, pty.Window.Width)
 
 	// display the pony
-	pony, err := process.getPony()
-	if err != nil {
-		log.Printf("failed to deliver pony: %s", err)
+	if err := process.writePony(); err != nil {
+		logger.Printf("failed to deliver pony: %s", err)
 		s.Close()
 		return
 	}
-	if _, err := s.Write(pony); err != nil {
-		log.Printf("failed to write pony: %s", err)
-		s.Close()
-		return
-	}
-	_, _ = io.WriteString(s, "\n")
 
 	// set up the terminal
 	term := term.NewTerminal(s, " > ")
@@ -205,7 +219,7 @@ func sshHandler(s ssh.Session, ponyUser string, opts *deploymentOptions) {
 		if err != nil {
 			// err == io.EOF when user presses ctrl+d
 			if !errors.Is(err, io.EOF) {
-				fmt.Println(err)
+				logger.Printf("failed to read user line: %s", err)
 			}
 			s.Close()
 			return
@@ -215,7 +229,7 @@ func sshHandler(s ssh.Session, ponyUser string, opts *deploymentOptions) {
 			return
 		}
 		if err := ProcessUserLine(s.Context(), process, line); err != nil {
-			log.Printf("failed to process user line: %s", err)
+			logger.Printf("failed to process user line: %s", err)
 			_, _ = io.WriteString(s, "Sorry, I don't know what to say. Bye.\n")
 			_ = s.Exit(2)
 			return
@@ -299,13 +313,12 @@ func (p *sshProcessor) WriteResponse(resp string) error {
 	return nil
 }
 
-func (p *sshProcessor) getPony() ([]byte, error) {
+func (p *sshProcessor) writePony() error {
 	say := fmt.Sprintf("Hello! My name is %s!", p.ponyName)
 	cmd := exec.Command("ponysay", "-W", strconv.Itoa(p.getWidth()), "-X", "-b", "ascii", "--pony", p.ponyCodeName, say)
-	var buf bytes.Buffer
-	cmd.Stdout = &buf
+	cmd.Stdout = p.session
 	if err := cmd.Run(); err != nil {
-		return nil, err
+		return fmt.Errorf("failed to run ponysay: %w", err)
 	}
-	return buf.Bytes(), nil
+	return nil
 }
