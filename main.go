@@ -18,8 +18,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/gliderlabs/ssh"
+	"github.com/hashicorp/go-retryablehttp"
 	"github.com/joho/godotenv"
 	"github.com/muesli/reflow/wordwrap"
 	"github.com/sashabaranov/go-openai"
@@ -76,10 +78,18 @@ func newDeploymentOptions(c *cli.Context) (*deploymentOptions, error) {
 }
 
 func makeOpenAIClient(d *deploymentOptions) *openai.Client {
+	retryClient := retryablehttp.NewClient()
+	retryClient.RetryMax = 3
+	retryClient.Logger = logger
+	retryClient.HTTPClient.Timeout = 10 * time.Minute
+	nativeClient := retryClient.StandardClient()
 	if d.openAIApiKey != "" {
-		return openai.NewClient(d.openAIApiKey)
+		config := openai.DefaultConfig(d.openAIApiKey)
+		config.HTTPClient = nativeClient
+		return openai.NewClientWithConfig(config)
 	}
 	config := openai.DefaultAzureConfig(d.azureOpenAIAccessKey, d.azureOpenAIEndpoint)
+	config.HTTPClient = nativeClient
 	if d.azureOpenAIDeploymentName != "" {
 		config.AzureModelMapperFunc = func(model string) string {
 			azureModelMapping := map[string]string{
