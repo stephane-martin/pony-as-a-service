@@ -28,55 +28,73 @@ import (
 	"golang.org/x/text/language"
 )
 
+const MODEL = openai.GPT3Dot5Turbo16K
+
 func main() {
 	_ = godotenv.Load()
-
-	app := cli.NewApp()
-	app.Name = "pony-as-a-service"
-	app.Usage = "deliver ponies as a service"
-	app.Action = serve
-	app.Flags = []cli.Flag{
-		cli.StringFlag{
-			Name:   "ssh-addr",
-			Usage:  "SSH listen address",
-			Value:  "127.0.0.1:2222",
-			EnvVar: "PONY_SSH_ADDR",
-		},
-		cli.StringFlag{
-			Name:   "hostkey",
-			Usage:  "SSH hostkey's file path",
-			Value:  "ponyhost",
-			EnvVar: "PONY_HOSTKEY",
-		},
-		cli.StringFlag{
-			Name:     "openai-api-key",
-			Usage:    "OpenAI API key",
-			EnvVar:   "OPENAI_API_KEY",
-			Required: true,
-		},
-		cli.StringFlag{
-			Name:     "ponyuser",
-			Usage:    "SSH pony user for authentication",
-			EnvVar:   "PONY_SSH_USER",
-			Required: true,
-		},
-		cli.StringFlag{
-			Name:   "ponypass",
-			Usage:  "SSH pony password for authentication",
-			EnvVar: "PONY_SSH_PASS",
-			Value:  "",
-		},
-	}
-	err := app.Run(os.Args)
-	if err != nil {
+	app := makeApp()
+	if err := app.Run(os.Args); err != nil {
 		log.Fatal(err)
 	}
+}
+
+type deploymentOptions struct {
+	openAIApiKey              string
+	azureOpenAIAccessKey      string
+	azureOpenAIEndpoint       string
+	azureOpenAIDeploymentName string
+}
+
+func (opts deploymentOptions) check() error {
+	if opts.openAIApiKey == "" && opts.azureOpenAIAccessKey == "" {
+		return errors.New("either OpenAI or Azure API key must be provided")
+	}
+	if opts.openAIApiKey != "" && opts.azureOpenAIAccessKey != "" {
+		return errors.New("only one of OpenAI or Azure API key must be provided")
+	}
+	if opts.azureOpenAIAccessKey != "" && opts.azureOpenAIDeploymentName == "" {
+		return errors.New("azure endpoint must be provided")
+	}
+	return nil
+}
+
+func newDeploymentOptions(c *cli.Context) (*deploymentOptions, error) {
+	opts := deploymentOptions{
+		openAIApiKey:              c.GlobalString("openai-api-key"),
+		azureOpenAIAccessKey:      c.GlobalString("azure-openai-access-key"),
+		azureOpenAIEndpoint:       c.GlobalString("azure-openai-endpoint"),
+		azureOpenAIDeploymentName: c.GlobalString("azure-openai-deployment-name"),
+	}
+	if err := opts.check(); err != nil {
+		return nil, err
+	}
+	return &opts, nil
+}
+
+func makeOpenAIClient(d *deploymentOptions) *openai.Client {
+	if d.openAIApiKey != "" {
+		return openai.NewClient(d.openAIApiKey)
+	}
+	config := openai.DefaultAzureConfig(d.azureOpenAIAccessKey, d.azureOpenAIEndpoint)
+	if d.azureOpenAIDeploymentName != "" {
+		config.AzureModelMapperFunc = func(model string) string {
+			azureModelMapping := map[string]string{
+				MODEL: d.azureOpenAIDeploymentName,
+			}
+			return azureModelMapping[model]
+		}
+	}
+	return openai.NewClientWithConfig(config)
 }
 
 func serve(c *cli.Context) error {
 	hostkey, err := os.ReadFile(c.GlobalString("hostkey"))
 	if err != nil {
 		return fmt.Errorf("failed to read SSH host key: %w", err)
+	}
+	dopts, err := newDeploymentOptions(c)
+	if err != nil {
+		return err
 	}
 	// capture signals
 	sigchan := make(chan os.Signal, 1)
@@ -110,7 +128,7 @@ func serve(c *cli.Context) error {
 	}
 	// the SSH handler to be called when a new SSH connection is opened
 	h := func(s ssh.Session) {
-		sshHandler(s, c.GlobalString("ponyuser"), c.GlobalString("openai-api-key"))
+		sshHandler(s, c.GlobalString("ponyuser"), dopts)
 	}
 
 	sshServer := &ssh.Server{Handler: h}
@@ -141,7 +159,7 @@ func serve(c *cli.Context) error {
 	return nil
 }
 
-func sshHandler(s ssh.Session, ponyUser string, openaiApiKey string) {
+func sshHandler(s ssh.Session, ponyUser string, opts *deploymentOptions) {
 	if s.User() != ponyUser {
 		_ = s.Exit(1)
 		return
@@ -152,7 +170,7 @@ func sshHandler(s ssh.Session, ponyUser string, openaiApiKey string) {
 		s.Close()
 		return
 	}
-	process := newSSHProcessor(openaiApiKey, s, pty.Window.Width)
+	process := newSSHProcessor(opts, s, pty.Window.Width)
 
 	// display the pony
 	pony, err := process.getPony()
@@ -206,7 +224,6 @@ func sshHandler(s ssh.Session, ponyUser string, openaiApiKey string) {
 }
 
 type sshProcessor struct {
-	openaiApiKey         string
 	session              ssh.Session
 	ponyCodeName         string
 	ponyName             string
@@ -216,17 +233,16 @@ type sshProcessor struct {
 	width                *int32
 }
 
-func newSSHProcessor(openaiApiKey string, session ssh.Session, initialWidth int) *sshProcessor {
+func newSSHProcessor(opts *deploymentOptions, session ssh.Session, initialWidth int) *sshProcessor {
 	ponyCodeName := listOfPonies[rand.Intn(len(listOfPonies))]
 	caser := cases.Title(language.English)
 	ponyName := caser.String(ponyCodeName)
-	client := openai.NewClient(openaiApiKey)
+	client := makeOpenAIClient(opts)
 	initMessage := openai.ChatCompletionMessage{
 		Role:    openai.ChatMessageRoleSystem,
 		Content: fmt.Sprintf(PROMPT_TEMPLATE, ponyName),
 	}
 	proc := &sshProcessor{
-		openaiApiKey:         openaiApiKey,
 		session:              session,
 		ponyCodeName:         ponyCodeName,
 		ponyName:             ponyName,

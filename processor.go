@@ -23,9 +23,8 @@ func ProcessUserLine(ctx context.Context, p Processor, line string) error {
 	}
 	p.AddMessage(userMessage)
 	req := openai.ChatCompletionRequest{
-		Model:          openai.GPT3Dot5Turbo1106,
-		Messages:       p.GetPreviousMessages(),
-		ResponseFormat: TextReponseFormat,
+		Model:    openai.GPT3Dot5Turbo16K,
+		Messages: p.GetPreviousMessages(),
 	}
 	resp, err := p.GetClient().CreateChatCompletion(ctx, req)
 	if err != nil {
