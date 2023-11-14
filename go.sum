@@ -31,6 +31,8 @@ github.com/russross/blackfriday/v2 v2.1.0 h1:JIOH55/0cWyOuilr9/qlrm0BSXldqnqwMsf
 github.com/russross/blackfriday/v2 v2.1.0/go.mod h1:+Rmxgy9KzJVeS9/2gXHxylqXiyQDYRxCVz55jmeOWTM=
 github.com/sashabaranov/go-openai v1.17.3 h1:08KipmMxCKVNqCkW2Pza+rqcAOAo41EGttzeVUGGT9w=
 github.com/sashabaranov/go-openai v1.17.3/go.mod h1:lj5b/K+zjTSFxVLijLSTDZuP7adOgerWeFyZLUhAKRg=
+github.com/stephane-martin/slog-syslog-handler v0.1.0 h1:WvM+OGS9h8c+yU/U6De3r/3J/Pd+ztCdpRInOb+iirg=
+github.com/stephane-martin/slog-syslog-handler v0.1.0/go.mod h1:q+PuvbCYPhjT/roHI8M23qgYXVef4fFPeJQ2AG4ZYtI=
 github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
 github.com/stretchr/objx v0.4.0/go.mod h1:YvHI0jy2hoMjB+UWwv71VJQ9isScKT/TqJzVSSt89Yw=
 github.com/stretchr/objx v0.5.0/go.mod h1:Yh+to48EsGEfYuaHDzXPcE3xhTkx73EhmCGUpEOglKo=

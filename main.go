@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"log/syslog"
 	"math/rand"
 	"net"
@@ -25,6 +25,7 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/muesli/reflow/wordwrap"
 	"github.com/sashabaranov/go-openai"
+	slogsysloghandler "github.com/stephane-martin/slog-syslog-handler"
 	"github.com/urfave/cli"
 	"golang.org/x/term"
 	"golang.org/x/text/cases"
@@ -33,13 +34,13 @@ import (
 
 const MODEL = openai.GPT3Dot5Turbo16K
 
-var logger = log.New(os.Stderr, "ponies ", 0)
+var logger = slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 func main() {
 	_ = godotenv.Load()
 	app := makeApp(serve)
 	if err := app.Run(os.Args); err != nil {
-		logger.Println(err)
+		logger.Error(err.Error())
 		os.Exit(1)
 	}
 }
@@ -103,11 +104,13 @@ func makeOpenAIClient(d *deploymentOptions) *openai.Client {
 
 func serve(c *cli.Context) error {
 	if c.GlobalBool("syslog") {
+		logger.Info("connecting to syslog")
 		syslogger, err := syslog.New(syslog.LOG_INFO|syslog.LOG_LOCAL3, "ponies")
 		if err != nil {
 			return fmt.Errorf("failed to connect to syslog: %w", err)
 		}
-		logger = log.New(syslogger, "ponies ", 0)
+		logger.Info("connected to syslog: stop writing logs on stderr")
+		logger = slogsysloghandler.NewLogger(syslogger, true, &slog.HandlerOptions{Level: slog.LevelInfo})
 	}
 	// read the SSH host key
 	hostkey, err := os.ReadFile(c.GlobalString("hostkey"))
@@ -128,7 +131,7 @@ func serve(c *cli.Context) error {
 		return fmt.Errorf("failed to listen on %s: %w", sshListenAddr, err)
 	}
 	defer sshListener.Close()
-	logger.Printf("listening on %s", sshListenAddr)
+	logger.Info("SSH listener", "addr", sshListenAddr)
 
 	// capture signals
 	sigchan := make(chan os.Signal, 1)
@@ -176,9 +179,9 @@ func serve(c *cli.Context) error {
 
 	wg.Add(1)
 	go func() {
-		logger.Println("ssh server starting")
+		logger.Info("ssh server starting")
 		if err := sshServer.Serve(sshListener); err != nil {
-			logger.Println(err)
+			logger.Error("ssh service stopped", "error", err)
 		}
 		wg.Done()
 	}()
@@ -188,16 +191,16 @@ func serve(c *cli.Context) error {
 }
 
 func sshHandler(s ssh.Session, ponyUser string, opts *deploymentOptions) {
-	logger.Printf("new connection from %s@%s", s.User(), s.RemoteAddr())
+	logger.Info("new SSH connection", "user", s.User(), "remote_addr", s.RemoteAddr())
 	if s.User() != ponyUser {
-		logger.Printf("user %s is not allowed to log in", s.User())
+		logger.Warn("user not allowed to log in", "user", s.User())
 		_ = s.Exit(1)
 		return
 	}
 	pty, winCh, isPty := s.Pty()
 	if !isPty {
 		_, _ = io.WriteString(s, "No PTY requested.\n")
-		logger.Println("no PTY requested")
+		logger.Info("no PTY requested")
 		s.Close()
 		return
 	}
@@ -205,7 +208,7 @@ func sshHandler(s ssh.Session, ponyUser string, opts *deploymentOptions) {
 
 	// display the pony
 	if err := process.writePony(); err != nil {
-		logger.Printf("failed to deliver pony: %s", err)
+		logger.Warn("failed to deliver pony", "error", err)
 		s.Close()
 		return
 	}
@@ -229,7 +232,7 @@ func sshHandler(s ssh.Session, ponyUser string, opts *deploymentOptions) {
 		if err != nil {
 			// err == io.EOF when user presses ctrl+d
 			if !errors.Is(err, io.EOF) {
-				logger.Printf("failed to read user line: %s", err)
+				logger.Warn("failed to read user line", "error", err)
 			}
 			s.Close()
 			return
@@ -239,7 +242,7 @@ func sshHandler(s ssh.Session, ponyUser string, opts *deploymentOptions) {
 			return
 		}
 		if err := ProcessUserLine(s.Context(), process, line); err != nil {
-			logger.Printf("failed to process user line: %s", err)
+			logger.Warn("failed to process user line", "error", err)
 			_, _ = io.WriteString(s, "Sorry, I don't know what to say. Bye.\n")
 			_ = s.Exit(2)
 			return
